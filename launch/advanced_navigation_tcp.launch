@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Connection parameters -->
+  <arg name="connection_type" default="tcp" doc="Type of connection: 'serial' or 'tcp'" />
+  <arg name="ip_address" default="192.168.0.201" doc="IP address of the Subsonus device" />
+  <arg name="tcp_port" default="16719" doc="TCP port of the Subsonus device" />
+  <arg name="port" default="/dev/ttyUSB0" doc="Serial port if using serial connection" />
+  <arg name="baud_rate" default="115200" doc="Baud rate if using serial connection" />
+
+  <!-- Frame ID parameters -->
+  <arg name="imu_frame_id" default="imu" />
+  <arg name="nav_sat_frame_id" default="gps" />
+  <arg name="topic_prefix" default="an_device" />
+  <arg name="subsonus_frame_id" default="subsonus_link" />
+  <arg name="remote_tag_frame_id" default="subsonus_tag_link" />
+
+  <node pkg="ros1_driver" type="ros1_driver" name="advanced_navigation_driver" output="screen">
+    <param name="connection_type" value="$(arg connection_type)" />
+    <param name="ip_address" value="$(arg ip_address)" />
+    <param name="tcp_port" value="$(arg tcp_port)" />
+    <param name="port" value="$(arg port)" />
+    <param name="baud_rate" value="$(arg baud_rate)" />
+    
+    <param name="imu_frame_id" value="$(arg imu_frame_id)" />
+    <param name="nav_sat_frame_id" value="$(arg nav_sat_frame_id)" />
+    <param name="topic_prefix" value="$(arg topic_prefix)" />
+    <param name="subsonus_frame_id" value="$(arg subsonus_frame_id)" />
+    <param name="remote_tag_frame_id" value="$(arg remote_tag_frame_id)" />
+  </node>
+</launch>

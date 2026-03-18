@@ -33,12 +33,21 @@
 #include <stdint.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
 #include <time.h>
 
 #include "NTRIP_Client/NTRIP/ntripclient.h"
 #include "rs232/rs232.h"
 #include "an_packet_protocol.h"
 #include "spatial_packets.h"
+#include "subsonus_packets.h"
+
+#include <ros1_driver/SubsonusRemoteTrack.h>
+#include <ros1_driver/SubsonusRemoteState.h>
+#include <ros1_driver/SubsonusRemoteOrientation.h>
+#include <ros1_driver/SubsonusSystemState.h>
 
 #include <sensor_msgs/NavSatFix.h>
 #include <sensor_msgs/TimeReference.h>
@@ -136,9 +145,12 @@ int main(int argc, char *argv[]) {
 	int write_counter = 0;
 	
 
-	// Set up the COM port
+	// Set up the COM port / Socket
 	int baud_rate;
 	std::string com_port;
+	std::string connection_type;
+	std::string ip_address;
+	int tcp_port;
 	std::string imu_frame_id;
 	std::string nav_sat_frame_id;
 	std::string rawsensors_magnetometer_frame_id;
@@ -150,17 +162,21 @@ int main(int argc, char *argv[]) {
 	tf::Quaternion orientation;
 	std_msgs::String gnss_fix_type_msgs;
 
-	// NTRIP Varialbles	
+	// Frame ID's
+	std::string subsonus_frame_id;
+	std::string remote_tag_frame_id;
+
+	// NTRIP Variables	
 	int error = 0;
 	int bytes_received;
 	int numbytes = 0;
 	int remain = numbytes;
 	int pos = 0;
-	int state; // 0 = NTRIP Info provided, 1 = No Arguement, 3 = Baudrate and Port for serial 
+	int state; // 0 = NTRIP Info provided, 1 = No Argument, 3 = Baud rate and Port for serial 
 	struct Args args;
 	char buf[MAXDATASIZE];
 
-	// Intialising for the log files
+	// Initializing the log files
 	rawtime = time(NULL);
 	timeinfo = localtime(&rawtime);
 	sprintf(filename, "Log_%02d-%02d-%02d_%02d-%02d-%02d.anpp", timeinfo->tm_year-100, timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
@@ -171,11 +187,15 @@ int main(int argc, char *argv[]) {
 		printf("argc: %d\n", argc);
 		pnh.param("port", com_port, std::string("/dev/ttyUSB0"));
 		pnh.param("baud_rate", baud_rate, 115200);
+		pnh.param("connection_type", connection_type, std::string("serial"));
+		pnh.param("ip_address", ip_address, std::string("192.168.0.201"));
+		pnh.param("tcp_port", tcp_port, 16719);
 		state = 1;
 	}
 	else if (argc == 3) {
 		com_port = std::string(argv[2]);
 		baud_rate = atoi(argv[1]);
+		connection_type = "serial";
 		state = 3;
 	}
 	else{
@@ -191,6 +211,10 @@ int main(int argc, char *argv[]) {
 	pnh.param("topic_prefix", topic_prefix, std::string("an_device"));
 	pnh.param("GNSS_Fix_Type", gnss_fix_type_id, std::string("gnss_fix_type"));
 
+	// Frame ID's
+	pnh.param("subsonus_frame_id", subsonus_frame_id, std::string("subsonus_link"));
+	pnh.param("remote_tag_frame_id", remote_tag_frame_id, std::string("remote_tag_link"));
+
 	// Initialise Publishers and Topics //
 	ros::Publisher imu_pub=nh.advertise<sensor_msgs::Imu>(topic_prefix + "/Imu",10);
 	ros::Publisher nav_sat_fix_pub=nh.advertise<sensor_msgs::NavSatFix>(topic_prefix + "/NavSatFix",10);
@@ -202,6 +226,10 @@ int main(int argc, char *argv[]) {
 	ros::Publisher system_status_pub=nh.advertise<diagnostic_msgs::DiagnosticStatus>(topic_prefix + "/SystemStatus",10);
 	ros::Publisher filter_status_pub=nh.advertise<diagnostic_msgs::DiagnosticStatus>(topic_prefix + "/FilterStatus",10);
 	ros::Publisher gnss_fix_type_pub=nh.advertise<std_msgs::String>(topic_prefix + "/GNSSFixType", 10);
+	ros::Publisher remote_track_pub = nh.advertise<ros1_driver::SubsonusRemoteTrack>(topic_prefix + "/RemoteTrack", 10);
+	ros::Publisher remote_state_pub = nh.advertise<ros1_driver::SubsonusRemoteState>(topic_prefix + "/RemoteState", 10);
+	ros::Publisher remote_orientation_pub = nh.advertise<ros1_driver::SubsonusRemoteOrientation>(topic_prefix + "/RemoteOrientation", 10);
+	ros::Publisher subsonus_system_state_pub = nh.advertise<ros1_driver::SubsonusSystemState>(topic_prefix + "/SubsonusSystemState", 10);
 
 	#pragma region // Initialise messages
 
@@ -286,9 +314,13 @@ int main(int argc, char *argv[]) {
 	an_decoder_t an_decoder;
 	an_packet_t *an_packet;
 	system_state_packet_t system_state_packet;
+	subsonus_system_state_packet_t subsonus_system_state_packet;
 	quaternion_orientation_standard_deviation_packet_t quaternion_orientation_standard_deviation_packet;
 	raw_sensors_packet_t raw_sensors_packet;
 	ecef_position_packet_t ecef_position_packet;
+	subsonus_remote_track_packet_t remote_track_packet;
+	subsonus_remote_state_packet_t remote_state_packet;
+	subsonus_remote_orientation_packet_t remote_orientation_packet;
 	#pragma endregion
 
 	// Opening the COM Port
@@ -306,15 +338,42 @@ int main(int argc, char *argv[]) {
 			error += 0;
 		}
 	}
+	int sock = -1;
 	if(state == 1 || state == 3){
-		if(OpenComport(const_cast<char*>(com_port.c_str()), baud_rate))
-		{
-			printf("Could not open serial port: %s \n",com_port.c_str());
-			exit(EXIT_FAILURE);
+		if(connection_type == "tcp") {
+			sock = socket(AF_INET, SOCK_STREAM, 0);
+			if (sock < 0) {
+				printf("Could not create socket\n");
+				exit(EXIT_FAILURE);
+			}
+			struct sockaddr_in server_addr;
+			server_addr.sin_family = AF_INET;
+			server_addr.sin_port = htons(tcp_port);
+			if (inet_pton(AF_INET, ip_address.c_str(), &server_addr.sin_addr) <= 0) {
+				printf("Invalid IP address: %s\n", ip_address.c_str());
+				exit(EXIT_FAILURE);
+			}
+			printf("Connecting to TCP %s:%d...\n", ip_address.c_str(), tcp_port);
+			if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+				printf("Connection failed\n");
+				exit(EXIT_FAILURE);
+			}
+			fcntl(sock, F_SETFL, O_NONBLOCK);
+			printf("Connected to %s:%d\n", ip_address.c_str(), tcp_port);
+		} else {
+			if(OpenComport(const_cast<char*>(com_port.c_str()), baud_rate))
+			{
+				printf("Could not open serial port: %s \n",com_port.c_str());
+				exit(EXIT_FAILURE);
+			}
 		}
 	}
 	// Request Config packets and also start decoding anpp packets
-	SendBuf((unsigned char*)request_all_configuration, sizeof(request_all_configuration));
+	if (connection_type == "tcp") {
+		send(sock, (unsigned char*)request_all_configuration, sizeof(request_all_configuration), 0);
+	} else {
+		SendBuf((unsigned char*)request_all_configuration, sizeof(request_all_configuration));
+	}
 	an_decoder_initialise(&an_decoder);
 		
 
@@ -322,7 +381,23 @@ int main(int argc, char *argv[]) {
 	while(ros::ok() && !error)
 	{
 		ros::spinOnce();
-		bytes_received = PollComport(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+		if (connection_type == "tcp") {
+			bytes_received = recv(sock, an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder), 0);
+			if (bytes_received < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					bytes_received = 0;
+					usleep(10000);
+				} else {
+					ROS_ERROR("Socket read error");
+					break;
+				}
+			} else if (bytes_received == 0) {
+				ROS_ERROR("Socket closed by remote");
+				break;
+			}
+		} else {
+			bytes_received = PollComport(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+		}
 		if(bytes_received > 0)
 		{
 			fwrite(an_decoder_pointer(&an_decoder), sizeof(uint8_t), bytes_received, log_file);
@@ -336,7 +411,76 @@ int main(int argc, char *argv[]) {
 				// System State Packet Decoding
 				if(an_packet->id == packet_id_system_state)
 				{
+					bool is_decoded = false;
 					if(decode_system_state_packet(&system_state_packet, an_packet) == 0)
+					{
+						is_decoded = true;
+					}
+					else if(decode_subsonus_system_state_packet(&subsonus_system_state_packet, an_packet) == 0)
+					{
+						is_decoded = true;
+
+						// Publish the custom message for Subsonus System State
+						ros1_driver::SubsonusSystemState msg;
+						msg.header.stamp = ros::Time::now(); // Default to current time
+						// msg.header.stamp.sec = subsonus_system_state_packet.unix_time_seconds;
+						// msg.header.stamp.nsec = subsonus_system_state_packet.microseconds * 1000;
+						msg.header.frame_id = subsonus_frame_id; // Using subsonus frame for generic system state
+						msg.system_status = subsonus_system_state_packet.system_status;
+						msg.filter_status = subsonus_system_state_packet.filter_status;
+						msg.unix_time_seconds = subsonus_system_state_packet.unix_time_seconds;
+						msg.microseconds = subsonus_system_state_packet.microseconds;
+						msg.latitude = subsonus_system_state_packet.latitude;
+						msg.longitude = subsonus_system_state_packet.longitude;
+						msg.height = subsonus_system_state_packet.height;
+						msg.velocity_north = subsonus_system_state_packet.velocity_north;
+						msg.velocity_east = subsonus_system_state_packet.velocity_east;
+						msg.velocity_down = subsonus_system_state_packet.velocity_down;
+						msg.body_acceleration_x = subsonus_system_state_packet.body_acceleration_x;
+						msg.body_acceleration_y = subsonus_system_state_packet.body_acceleration_y;
+						msg.body_acceleration_z = subsonus_system_state_packet.body_acceleration_z;
+						msg.g_force = subsonus_system_state_packet.g_force;
+						msg.roll = subsonus_system_state_packet.roll;
+						msg.pitch = subsonus_system_state_packet.pitch;
+						msg.heading = subsonus_system_state_packet.heading;
+						msg.angular_velocity_x = subsonus_system_state_packet.angular_velocity_x;
+						msg.angular_velocity_y = subsonus_system_state_packet.angular_velocity_y;
+						msg.angular_velocity_z = subsonus_system_state_packet.angular_velocity_z;
+						msg.latitude_standard_deviation = subsonus_system_state_packet.latitude_stddev;
+						msg.longitude_standard_deviation = subsonus_system_state_packet.longitude_stddev;
+						msg.height_standard_deviation = subsonus_system_state_packet.height_stddev;
+						msg.roll_standard_deviation = subsonus_system_state_packet.roll_stddev;
+						msg.pitch_standard_deviation = subsonus_system_state_packet.pitch_stddev;
+						msg.heading_standard_deviation = subsonus_system_state_packet.heading_stddev;
+						subsonus_system_state_pub.publish(msg);
+
+						// Also map to generic system_state_packet so standard topics can be published
+						system_state_packet.system_status.r = (uint16_t)(subsonus_system_state_packet.system_status & 0xFFFF);
+						system_state_packet.filter_status.r = (uint16_t)(subsonus_system_state_packet.filter_status & 0xFFFF);
+						system_state_packet.unix_time_seconds = subsonus_system_state_packet.unix_time_seconds;
+						system_state_packet.microseconds = subsonus_system_state_packet.microseconds;
+						system_state_packet.latitude = subsonus_system_state_packet.latitude;
+						system_state_packet.longitude = subsonus_system_state_packet.longitude;
+						system_state_packet.height = subsonus_system_state_packet.height;
+						system_state_packet.velocity[0] = subsonus_system_state_packet.velocity_north;
+						system_state_packet.velocity[1] = subsonus_system_state_packet.velocity_east;
+						system_state_packet.velocity[2] = subsonus_system_state_packet.velocity_down;
+						system_state_packet.body_acceleration[0] = subsonus_system_state_packet.body_acceleration_x;
+						system_state_packet.body_acceleration[1] = subsonus_system_state_packet.body_acceleration_y;
+						system_state_packet.body_acceleration[2] = subsonus_system_state_packet.body_acceleration_z;
+						system_state_packet.g_force = subsonus_system_state_packet.g_force;
+						system_state_packet.orientation[0] = subsonus_system_state_packet.roll;
+						system_state_packet.orientation[1] = subsonus_system_state_packet.pitch;
+						system_state_packet.orientation[2] = subsonus_system_state_packet.heading;
+						system_state_packet.angular_velocity[0] = subsonus_system_state_packet.angular_velocity_x;
+						system_state_packet.angular_velocity[1] = subsonus_system_state_packet.angular_velocity_y;
+						system_state_packet.angular_velocity[2] = subsonus_system_state_packet.angular_velocity_z;
+						system_state_packet.standard_deviation[0] = subsonus_system_state_packet.latitude_stddev;
+						system_state_packet.standard_deviation[1] = subsonus_system_state_packet.longitude_stddev;
+						system_state_packet.standard_deviation[2] = subsonus_system_state_packet.height_stddev;
+					}
+
+					if(is_decoded)
 					{
 						// GNSS FIX TYPE
 						switch(system_state_packet.filter_status.b.gnss_fix_type)
@@ -656,6 +800,135 @@ int main(int argc, char *argv[]) {
 					
 				}
 
+				if ((an_packet->id == 24) && (decode_subsonus_remote_track_packet(&remote_track_packet, an_packet) == 0)) {
+					ros1_driver::SubsonusRemoteTrack rt_msg;
+					rt_msg.header.stamp = ros::Time::now(); // Default to current time
+					
+					// Calculate true sensor-level timestamp by subtracting remote_age_microseconds
+					// uint64_t packet_time_us = (uint64_t)remote_track_packet.unix_time_seconds * 1000000ULL + remote_track_packet.microseconds;
+					// uint32_t remote_age_us = remote_track_packet.remote_age_microseconds;
+					// if (packet_time_us >= remote_age_us) {
+					// 	uint64_t true_time_us = packet_time_us - remote_age_us;
+					// 	rt_msg.header.stamp.sec = true_time_us / 1000000ULL;
+					// 	rt_msg.header.stamp.nsec = (true_time_us % 1000000ULL) * 1000ULL;
+					// } else {
+					// 	// Fallback if calculated time is somehow negative 
+					// 	rt_msg.header.stamp.sec = remote_track_packet.unix_time_seconds;
+					// 	rt_msg.header.stamp.nsec = remote_track_packet.microseconds * 1000ULL;
+					// }
+					rt_msg.header.frame_id = subsonus_frame_id;
+					
+					rt_msg.device_address = remote_track_packet.device_address;
+					rt_msg.tracking_status = remote_track_packet.tracking_status;
+					rt_msg.system_status = remote_track_packet.system_status;
+					rt_msg.filter_status = remote_track_packet.filter_status;
+					rt_msg.data_valid_flags = remote_track_packet.data_valid_flags;
+					rt_msg.unix_time_seconds = remote_track_packet.unix_time_seconds;
+					rt_msg.microseconds = remote_track_packet.microseconds;
+					rt_msg.local_latitude = remote_track_packet.local_latitude;
+					rt_msg.local_longitude = remote_track_packet.local_longitude;
+					rt_msg.local_height = remote_track_packet.local_height;
+					rt_msg.local_velocity_north = remote_track_packet.local_velocity_north;
+					rt_msg.local_velocity_east = remote_track_packet.local_velocity_east;
+					rt_msg.local_velocity_down = remote_track_packet.local_velocity_down;
+					rt_msg.local_roll = remote_track_packet.local_roll;
+					rt_msg.local_pitch = remote_track_packet.local_pitch;
+					rt_msg.local_heading = remote_track_packet.local_heading;
+					rt_msg.local_latitude_stddev = remote_track_packet.local_latitude_stddev;
+					rt_msg.local_longitude_stddev = remote_track_packet.local_longitude_stddev;
+					rt_msg.local_height_stddev = remote_track_packet.local_height_stddev;
+					rt_msg.local_roll_stddev = remote_track_packet.local_roll_stddev;
+					rt_msg.local_pitch_stddev = remote_track_packet.local_pitch_stddev;
+					rt_msg.local_heading_stddev = remote_track_packet.local_heading_stddev;
+					rt_msg.local_depth = remote_track_packet.local_depth;
+					rt_msg.remote_age_microseconds = remote_track_packet.remote_age_microseconds;
+					rt_msg.remote_range = remote_track_packet.remote_range;
+					rt_msg.remote_azimuth = remote_track_packet.remote_azimuth;
+					rt_msg.remote_elevation = remote_track_packet.remote_elevation;
+					rt_msg.remote_position_raw_x = remote_track_packet.remote_position_raw_x;
+					rt_msg.remote_position_raw_y = remote_track_packet.remote_position_raw_y;
+					rt_msg.remote_position_raw_z = remote_track_packet.remote_position_raw_z;
+					rt_msg.remote_position_x = remote_track_packet.remote_position_x;
+					rt_msg.remote_position_y = remote_track_packet.remote_position_y;
+					rt_msg.remote_position_z = remote_track_packet.remote_position_z;
+					rt_msg.remote_north = remote_track_packet.remote_north;
+					rt_msg.remote_east = remote_track_packet.remote_east;
+					rt_msg.remote_down = remote_track_packet.remote_down;
+					rt_msg.remote_latitude = remote_track_packet.remote_latitude;
+					rt_msg.remote_longitude = remote_track_packet.remote_longitude;
+					rt_msg.remote_height = remote_track_packet.remote_height;
+					rt_msg.remote_range_stddev = remote_track_packet.remote_range_stddev;
+					rt_msg.remote_azimuth_stddev = remote_track_packet.remote_azimuth_stddev;
+					rt_msg.remote_elevation_stddev = remote_track_packet.remote_elevation_stddev;
+					rt_msg.remote_latitude_stddev = remote_track_packet.remote_latitude_stddev;
+					rt_msg.remote_longitude_stddev = remote_track_packet.remote_longitude_stddev;
+					rt_msg.remote_height_stddev = remote_track_packet.remote_height_stddev;
+					rt_msg.remote_depth = remote_track_packet.remote_depth;
+					rt_msg.signal_level = remote_track_packet.signal_level;
+					rt_msg.signal_to_noise_ratio = remote_track_packet.signal_to_noise_ratio;
+					rt_msg.signal_correlation_ratio = remote_track_packet.signal_correlation_ratio;
+					rt_msg.signal_correlation_interference = remote_track_packet.signal_correlation_interference;
+					rt_msg.reserved = remote_track_packet.reserved;
+					remote_track_pub.publish(rt_msg);
+				}
+
+				if ((an_packet->id == 25) && (decode_subsonus_remote_state_packet(&remote_state_packet, an_packet) == 0)) {
+					ros1_driver::SubsonusRemoteState rs_msg;
+					rs_msg.header.stamp = ros::Time::now(); // Default to current time
+					// rs_msg.header.stamp.sec = remote_state_packet.unix_time_seconds;
+					// rs_msg.header.stamp.nsec = remote_state_packet.microseconds * 1000;
+					rs_msg.header.frame_id = remote_tag_frame_id;
+					
+					rs_msg.device_address = remote_state_packet.device_address;
+					rs_msg.system_status_valid_flags = remote_state_packet.system_status_valid_flags;
+					rs_msg.filter_status_valid_flags = remote_state_packet.filter_status_valid_flags;
+					rs_msg.system_status = remote_state_packet.system_status;
+					rs_msg.filter_status = remote_state_packet.filter_status;
+					rs_msg.data_valid_flags = remote_state_packet.data_valid_flags;
+					rs_msg.unix_time_seconds = remote_state_packet.unix_time_seconds;
+					rs_msg.microseconds = remote_state_packet.microseconds;
+					rs_msg.latitude = remote_state_packet.latitude;
+					rs_msg.longitude = remote_state_packet.longitude;
+					rs_msg.height = remote_state_packet.height;
+					rs_msg.velocity_north = remote_state_packet.velocity_north;
+					rs_msg.velocity_east = remote_state_packet.velocity_east;
+					rs_msg.velocity_down = remote_state_packet.velocity_down;
+					rs_msg.body_acceleration_x = remote_state_packet.body_acceleration_x;
+					rs_msg.body_acceleration_y = remote_state_packet.body_acceleration_y;
+					rs_msg.body_acceleration_z = remote_state_packet.body_acceleration_z;
+					rs_msg.g_force = remote_state_packet.g_force;
+					rs_msg.roll = remote_state_packet.roll;
+					rs_msg.pitch = remote_state_packet.pitch;
+					rs_msg.heading = remote_state_packet.heading;
+					rs_msg.angular_velocity_x = remote_state_packet.angular_velocity_x;
+					rs_msg.angular_velocity_y = remote_state_packet.angular_velocity_y;
+					rs_msg.angular_velocity_z = remote_state_packet.angular_velocity_z;
+					rs_msg.latitude_stddev = remote_state_packet.latitude_stddev;
+					rs_msg.longitude_stddev = remote_state_packet.longitude_stddev;
+					rs_msg.height_stddev = remote_state_packet.height_stddev;
+					rs_msg.roll_stddev = remote_state_packet.roll_stddev;
+					rs_msg.pitch_stddev = remote_state_packet.pitch_stddev;
+					rs_msg.heading_stddev = remote_state_packet.heading_stddev;
+					remote_state_pub.publish(rs_msg);
+				}
+
+				if ((an_packet->id == 101) && (decode_subsonus_remote_orientation_packet(&remote_orientation_packet, an_packet) == 0)) {
+					ros1_driver::SubsonusRemoteOrientation ro_msg;
+					ro_msg.header.stamp = ros::Time::now(); // Default to current time
+					// ro_msg.header.stamp.sec = remote_orientation_packet.observer_unix_time_seconds;
+					// ro_msg.header.stamp.nsec = remote_orientation_packet.observer_microseconds * 1000;
+					ro_msg.header.frame_id = remote_tag_frame_id;
+					
+					ro_msg.device_address = remote_orientation_packet.device_address;
+					ro_msg.observer_unix_time_seconds = remote_orientation_packet.observer_unix_time_seconds;
+					ro_msg.observer_microseconds = remote_orientation_packet.observer_microseconds;
+					ro_msg.data_valid_flags = remote_orientation_packet.data_valid_flags;
+					ro_msg.roll = remote_orientation_packet.roll;
+					ro_msg.pitch = remote_orientation_packet.pitch;
+					ro_msg.heading = remote_orientation_packet.heading;
+					remote_orientation_pub.publish(ro_msg);
+				}
+
 				// Ensure that you free the an_packet when your done with it or you will leak memory                                  
 				an_packet_free(&an_packet);
 
@@ -681,7 +954,7 @@ int main(int argc, char *argv[]) {
 		
 		char nmea[MAX_NMEA_STRING_LENGTH];
 		int n = generateGPGGA(nmea, system_state_packet);
-		ROS_WARN_STREAM(nmea);		
+		// ROS_WARN_STREAM(nmea); // Muted spam output
 		args.nmea = nmea;
 		/*getargs(argc, argv, &args);
 		error = ntrip_initialise(&args, buf);
